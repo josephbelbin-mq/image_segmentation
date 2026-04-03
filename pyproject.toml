@@ -1,0 +1,22 @@
+[project]
+name = "image_segmentation"
+version = "0.1.0"
+description = "Library for multiple types of image segmentation algorithm"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "numpy",
+    "torch",
+    "torchvision",
+    "matplotlib",
+    "opencv-python",
+    "transforms3d",
+    "transformers",
+    "diffusers",
+    "accelerate",
+    "safetensors",
+    "pillow",
+    "attention_map_diffusers",
+    "segment-anything @ git+https://github.com/facebookresearch/segment-anything.git",
+]
+[tool.uv.extra-build-dependencies]

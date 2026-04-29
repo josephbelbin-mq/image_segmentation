@@ -18,5 +18,10 @@ dependencies = [
     "pillow",
     "attention_map_diffusers",
     "segment-anything @ git+https://github.com/facebookresearch/segment-anything.git",
+    "x-segment-anything",
+    "scikit-learn",
+    "smart_open",
+    "s3fs",
+    "boto3"
 ]
 [tool.uv.extra-build-dependencies]

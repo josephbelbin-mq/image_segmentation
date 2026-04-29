@@ -32,7 +32,9 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 set_seed(42)
 #IMAGE_NAME = "resized_test_fire_frame43.jpg"
 repo_root = Path.cwd()
-IMAGE_NAME = repo_root / "data" / "test_images" / "Untitled.jpg"
+#IMAGE_NAME = repo_root / "data" / "test_images" / "Untitled.jpg"
+IMAGE_NAME = repo_root / "data" / "test_images" / "KNP-backburning-5.jpeg"
+
 KL_THRESH_1 = 0.4
 KL_THRESH = 0.8
 TIMESTEP = 300   # good starting point (try 250–450)

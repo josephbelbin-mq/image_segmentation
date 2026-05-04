@@ -121,5 +121,62 @@ def make_segmentation_figure(res, alpha=0.4):
     add_palette_legend(fig, res["palette"])
     return fig
 
+def make_detection_figure(image, results, figsize=(10, 10)):
+
+    """
+    image: HxWx3 numpy array
+    results: list of dicts with keys:
+        - label
+        - box
+        - regime ('concentrated' or 'diffuse')
+        - context_box (optional)
+    """
+
+    fig, ax = plt.subplots(1, 1, figsize=figsize)
+    ax.imshow(image)
+    ax.axis("off")
+
+    for r in results:
+        box = r["box"]
+        regime = r["regime"]
+        label = r["label"]
+        ctx = r.get("context_box", None)
+
+        # ---- draw parent/context box (dashed) ----
+        if ctx is not None:
+            x1, y1, x2, y2 = ctx
+            ax.add_patch(plt.Rectangle(
+                (x1, y1), x2 - x1, y2 - y1,
+                fill=False,
+                linestyle="--",
+                linewidth=1.5,
+                edgecolor="yellow"
+            ))
+
+        # ---- draw main box ----
+        x1, y1, x2, y2 = box
+        color = "lime" if regime == "concentrated" else "orange"
+        style = "-" if regime == "concentrated" else "--"
+
+        ax.add_patch(plt.Rectangle(
+            (x1, y1), x2 - x1, y2 - y1,
+            fill=False,
+            linestyle=style,
+            linewidth=2.5,
+            edgecolor=color
+        ))
+
+        ax.text(
+            x1, y1 - 5,
+            f"{label} ({regime})",
+            color=color,
+            fontsize=9,
+            backgroundcolor="black"
+        )
+
+    return fig
+
+
+
 
 

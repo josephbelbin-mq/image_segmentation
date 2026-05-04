@@ -15,34 +15,55 @@ import s3fs
 import boto3
 from smart_open import open as smart_open
 
-
-from code.utils.image_io import (
-    save_all_outputs,
-    save_binary_mask,
-    save_overlay,
-)
-
-
 from code.utils.image_viz import (
-    view_image,
-    view_color_map,
-    view_blended,
-    view_binary_mask,
-    make_segmentation_figure
+    make_detection_figure
 )
 
 repo_root = Path.cwd()
-#FILE_NAME = "resized_test_fire_frame189.jpg"
-FILE_NAME = "Fire3.jpg"
-IMAGE_NAME = repo_root / "data" / "test_images" / FILE_NAME
-#FILE_NAME = "KNP-backburning-5.jpeg"
-#FILE_NAME = "D4935-1.jpg"
-#FILE_NAME = "OIP.jpg"
-#FILE_NAME = "OIP_3.jpg"
 
 processor = None
 model = None
 device = None
+import json
+
+def save_results_json(res, out_dir, image_path):
+    """
+    res: {
+        "image": image (ignored here),
+        "results": list of dicts with keys:
+            - label
+            - score
+            - box
+            - regime
+            - context_box (optional)
+    }
+    """
+
+    stem = Path(image_path).stem
+    out_path = Path(out_dir) / f"{stem}.json"
+
+    serializable = {
+        "image": str(image_path),
+        "results": []
+    }
+
+    for r in res["results"]:
+        entry = {
+            "label": r["label"],
+            "regime": r["regime"],
+            "score": None if r.get("score") is None else float(r["score"]),
+            "box": [float(x) for x in r["box"]] if r.get("box") is not None else None,
+        }
+
+        # include context_box only if present
+        if r.get("context_box") is not None:
+            entry["context_box"] = [float(x) for x in r["context_box"]]
+
+        serializable["results"].append(entry)
+
+    with open(out_path, "w") as f:
+        json.dump(serializable, f, indent=2)
+
 
 def apply_nms(candidates, iou_thresh=0.4):
     if len(candidates) == 0:
@@ -58,6 +79,12 @@ def apply_nms(candidates, iou_thresh=0.4):
     )
 
     return [candidates[i] for i in keep]
+
+
+def box_area(box):
+    x1, y1, x2, y2 = box
+    return max(0, x2 - x1) * max(0, y2 - y1)
+
 
 def tile_box(box, H, W, tile_size=256, stride=192):
     """
@@ -96,16 +123,15 @@ def init(
     processor = AutoProcessor.from_pretrained(model_id)
     model = AutoModelForZeroShotObjectDetection.from_pretrained(model_id).to(device)
 
-def load_and_segment(
+def generate_boxes(
     image_path: str,
     device: str = "cuda",
     width: int = 512,
     height: int = 512,
-    second_pass: bool = False,
     threshold: float = 0.2,
     text_threshold: float = 0.2,
-    second_pass_threshold: float = 0.4,
-    second_pass_text_threshold: float = 0.3,
+    second_pass_threshold = 0.4,
+    second_pass_text_threshold = 0.4,
     text_prompt: str = "fire. flame. smoke.",
     dtype: str = "float16",
     aws_profile: str = "default",
@@ -160,198 +186,125 @@ def load_and_segment(
     scores = [r["scores"].cpu().numpy() for r in results]
     labels = [r["text_labels"] for r in results]
 
-    filtered = []
-    tiled = []
-    candidates = []
-    tiling = True
+
+    results_out = []
+    small_boxes = []
+    large_boxes = []
     for box, score, label in zip(boxes[0], scores[0], labels[0]):
         x1, y1, x2, y2 = box
         area = (x2 - x1) * (y2 - y1)
-        if area < 0.4 * H * W:
-            filtered.append((label, score, box))
+        if area < 0.33 * H * W:            
+            small_boxes.append((label, score, box))
         else: 
-            if label == "smoke" and score < 0.6:
-                continue
-            # 2nd pass candidates 
-            candidates.append((label, score, box))
-    if tiling:
-        filtered_candidates = apply_nms(candidates, iou_thresh=0.4)
-
-        tile = max(H, W) // 3
-        #stride = max(H, W) // 4 
-        stride = tile 
-        for label, score, box in filtered_candidates:
-            boxes = tile_box(box, H, W, tile, stride)
-            for b in boxes:
-                tiled.append((label, score, np.array(b, dtype=np.float32)))
-    else:
-        tiled = candidates
-
-    #print(f"Number of tiles = {len(tiled)}")
-    ###### 2nd pass DINO ######
-    if (second_pass):
-        scd_pass_boxes = []
-        all_images = []
-        all_boxes = []
-        for i, (label, score, box) in enumerate(tiled):
-            print(f"2nd pass {i}: label={label}, score={score:.3f}, box={box}")
-            x1, y1, x2, y2 = box
-
-            w = (x2 - x1)
-            h = (y2 - y1)
-            #expand 10%
-            w = w * 1.1
-            h = h * 1.1
-            a = w * h
-            #print(f"2nd pass {i}: x1={x1} x2 = {x2} y1={y1} y2={y2} w={w} h={h} area={a}")
-            cx = (x1 + x2) / 2
-            cy = (y1 + y2) / 2
-            x1 = max(cx - (w / 2), 0)
-            x2 = min(cx + (w / 2), W)
-            y1 = max(cy - (h / 2), 0)
-            y2 = min(cy + (h / 2), H)
-            expanded = (x1, y1, x2, y2)
-            cropped = image.crop(expanded)
-
-            w, h = cropped.size
-            cropped = cropped.resize((w // 2, h // 2), resample=Image.BILINEAR)
-            all_images.append(cropped)
-            all_boxes.append((x1, y1, x2, y2))
-        batch_size = 2  # start small (1–4 typical)
-
-        results = []
-        print(f"2nd pass DINO - {len(all_images)}")
-        for i in range(0, len(all_images), batch_size):
-            #images = cropped
-            images = all_images[i:i+batch_size]
-            inputs = processor(
-                images=images,
-                text=[text_prompt] * len(images),
-                return_tensors="pt"
-            ).to(device)
-
-            with torch.no_grad():
-                outputs = model(**inputs)
-
-            results = processor.post_process_grounded_object_detection(
-                outputs,
-                inputs.input_ids,
-                threshold=second_pass_threshold,
-                text_threshold=second_pass_text_threshold,
-                target_sizes=[img.size[::-1] for img in images],
-                #target_sizes=[cropped.size[::-1]],
-            )
-            for j, r in enumerate(results):
-                boxes = r["boxes"].cpu().numpy()
-                scores = r["scores"].cpu().numpy()
-                labels = r["text_labels"]
-                x1, y1, x2, y2 = all_boxes[i+j]
-                for box, score, label in zip(boxes, scores, labels):
-                    #box *= 2
-                    #a1, b1, a2, b2 = box
-                    #area = (a2 - a1) * (b2 - b1)
-                    #if area >= 0.5 * h * w:
-                    #    print(f"TOO BIG a1={a1} a2={a2} b1={b1} b2={b2} area={area}")
-                    #    continue
-                    if not label:
-                        continue
-                    if label == "smoke" and score < 0.6:
-                        continue
-                    shift = np.array([x1, y1, x1, y1])
-                    box = box * 2
-                    box = box + shift
-                    print(f"Appending: label={label}, score={score:.3f}, box={box}")
-                    scd_pass_boxes.append((label, score, box))
-
-        filtered = filtered + scd_pass_boxes
-
-
-    print(f"SAM")
-    # -------- Load SAM --------
-    sam_checkpoint = repo_root / "externals" / "mobile_sam.pt"
-    sam_model = sam_model_registry["vit_t"](checkpoint=sam_checkpoint)
-    sam_model.to(device)
-    predictor = SamPredictor(sam_model)
-    predictor.set_image(np.array(image))
-
-    # -------- Get masks --------
-    from collections import defaultdict
-    label_masks = defaultdict(list)
-    for i, (label, score, box) in enumerate(filtered):
-        masks, scores, logits = predictor.predict(box=box)
-        best_idx = np.argmax(scores)
-        mask = masks[best_idx]
-        if (label == "smoke"):
-            label = "smoke"
-        elif ("smoke" in label):
-            label = "mixed"
-        else:
-            label = "fire"
-        label_masks[label].append(mask)
-
-    merged_masks = {}
-    for label, masks_list in label_masks.items():
-        #print(f"{label} label added")
-        merged = np.logical_or.reduce(masks_list)
-        merged_masks[label] = merged
-
-    w, h = image.size
-    def safe_mask(mask):
-        if mask is None:
-            return np.zeros((h, w), dtype=bool)
-        return mask > 0
+            large_boxes.append((label, score, box))
     
-    fire  = safe_mask(merged_masks.get("fire"))
-    smoke  = safe_mask(merged_masks.get("smoke"))
-    mixed  = safe_mask(merged_masks.get("mixed"))
+    small_boxes = apply_nms(small_boxes, 0.7)
+    for i, (label, score, box) in enumerate(small_boxes):
+        results_out.append({
+                    "label": label,
+                    "score": float(score) if score is not None else None,
+                    "box": [float(x) for x in box],          # geometry only
+                    "regime": "concentrated",    # or "concentrated"
+                    "context_box": None                 # filled only if concentrated
+                })
 
-    
-    # count how many classes are active per pixel
-    stack = np.stack([fire, smoke, mixed], axis=0)
-    count = stack.sum(axis=0)
+    large_boxes = apply_nms(large_boxes)
 
-    FIRE, SMOKE, MIXED = 1, 2, 3
+    #Rerun DINO on large_boxes
+    for i, (label, score, box) in enumerate(large_boxes):
+        
+        print(f"2nd pass {i}: label={label}, score={score:.3f}, box={box}")
+        x1, y1, x2, y2 = box
 
-    label_map = np.zeros((h, w), dtype=np.uint8)
+        w = (x2 - x1)
+        h = (y2 - y1)
+        #expand 10%
+        w = w * 1.1
+        h = h * 1.1
+        a = w * h
+        #print(f"2nd pass {i}: x1={x1} x2 = {x2} y1={y1} y2={y2} w={w} h={h} area={a}")
+        cx = (x1 + x2) / 2
+        cy = (y1 + y2) / 2
+        x1 = max(cx - (w / 2), 0)
+        x2 = min(cx + (w / 2), W)
+        y1 = max(cy - (h / 2), 0)
+        y2 = min(cy + (h / 2), H)
+        expanded = (x1, y1, x2, y2)
+        cropped = image.crop(expanded)
 
-    # single-class pixels
-    label_map[(fire & (count == 1))] = FIRE
-    label_map[(smoke & (count == 1))] = SMOKE
+        w, h = cropped.size
+        #cropped = cropped.resize((w // 2, h // 2), resample=Image.BILINEAR)
+        
+        inputs = processor(images=cropped, text=text_prompt, return_tensors="pt").to(device)
 
-    # everything else becomes mixed:
-    # - overlaps
-    # - explicit mixed
-    # - any conflict
-    label_map[count >= 2] = MIXED
-    label_map[mixed] = MIXED
+        with torch.no_grad():
+            outputs = model(**inputs)
 
-    PALETTE = {
-        FIRE: ("Fire", (255, 80, 80)),     # fire (warm red, not pure red)
-        SMOKE: ("Smoke",(80, 160, 255)),    # smoke (cool blue)
-        MIXED: ("Mixed", (255, 215, 0)),     # mixed (gold/yellow)
+        sub_results = processor.post_process_grounded_object_detection(
+            outputs,
+            inputs.input_ids,
+            threshold=second_pass_threshold,
+            text_threshold=second_pass_text_threshold,
+            target_sizes=[cropped.size[::-1]],
+        )
+
+        
+        refined_boxes = []
+
+        sub_boxes  = sub_results[0]["boxes"].cpu().numpy()
+        sub_scores = sub_results[0]["scores"].cpu().numpy()
+        sub_labels = sub_results[0]["text_labels"]
+
+        for sb, ss, sl in zip(sub_boxes, sub_scores, sub_labels):
+            print(f"    2nd pass detection {i}: label={sl}, score={ss:.3f}, box={sb}")
+            bx1, by1, bx2, by2 = sb
+            bx1 += x1; bx2 += x1
+            by1 += y1; by2 += y1
+            refined_boxes.append((sl, ss, np.array([bx1, by1, bx2, by2])))
+
+        
+        small_boxes = []
+        large_boxes_2 = []
+        for sl, ss, sb in refined_boxes:
+            area_ratio = box_area(sb) / box_area(box)
+            if area_ratio < 0.33:      # refinement exists
+                small_boxes.append((sl, ss, sb))
+            else:
+                large_boxes_2.append((sl, ss, sb))
+
+        for sl, ss, sb in small_boxes:
+            # ✅ object-mode
+            results_out.append({
+                "label": sl,
+                "score": float(ss) if ss is not None else None,
+                "box": [float(x) for x in sb],
+                "regime": "concentrated",    # or "concentrated"
+                "context_box": [float(x) for x in box]
+            })
+
+        if not small_boxes or large_boxes_2:
+            # ✅ diffuse smoke still present
+            results_out.append({
+                "label": label,
+                "score": float(score) if score is not None else None,
+                "box": [float(x) for x in box],          # geometry only
+                "regime": "diffuse",    # or "concentrated"
+                "context_box": None
+            })
+
+    res = {
+        "image": image,
+        "results": results_out
     }
+    return res
 
-    overlay = np.zeros((h, w, 3), dtype=np.uint8)
-
-
-    if not isinstance(image, np.ndarray):
-        image_np = np.array(image)
-    else:
-        image_np = image
-
-    return {
-        "image": image_np,
-        "label_map": label_map,
-        "binary_mask": (label_map > 0),
-        "palette": PALETTE,
-    }
 
 
 def main():
     parser = argparse.ArgumentParser(description="Load an image and generate masks with SAM.")
 
     # Image and device
-    parser.add_argument("--image_path", type=str, default=IMAGE_NAME, help="Path to input image")
+    parser.add_argument("--image_path", type=str, required=True, help="Path to input image")
     parser.add_argument("--device", type=str, default="cuda", help="Device to run the model (cuda or cpu)")
 
     # Image resizing
@@ -359,7 +312,6 @@ def main():
     parser.add_argument("--height", type=int, default=0, help="Resize image height - by default no resizign")
 
     # Model parameters
-    parser.add_argument("--second_pass", action="store_true", help="enable second pass mode")
     parser.add_argument("--threshold", type=float, default=0.2, help=" threshold")
     parser.add_argument("--text_threshold", type=float, default=0.2, help="text labelling threshold")
     parser.add_argument("--second_pass_threshold", type=float, default=0.4, help=" threshold")
@@ -369,6 +321,9 @@ def main():
     parser.add_argument("--aws_profile", type=str, default="ieee-dataport", help="AWS Profile")
     parser.add_argument("--save_images", action="store_true",
                         help="Save image outputs (mask, segmentation, overlay)")
+    parser.add_argument("--save_json", action="store_true",
+                        help="Save json outputs")
+                        
     parser.add_argument("--save_pdf", action="store_true",
                         help="Save segmentation figures to a PDF")
     parser.add_argument("--show", action="store_true",
@@ -444,12 +399,11 @@ def main():
 
         #print(f"Processing {image_path}")
         # Load and segment
-        res = load_and_segment(
+        res = generate_boxes(
             image_path=image_path,
             device=args.device,
             width=args.width,
             height=args.height,
-            second_pass=args.second_pass,
             threshold=args.threshold,
             text_threshold=args.text_threshold,
             second_pass_threshold=args.second_pass_threshold,
@@ -460,26 +414,26 @@ def main():
         )
         t1 = time.perf_counter()
         print(f"processing: {t1 - t0:.3f}s")
+        
+        from rich import print_json
 
-
-        fig = make_segmentation_figure(res)
-
+        print_json(data=res["results"])
+        fig = make_detection_figure(res["image"], res["results"])
         if args.save_images:
-            save_all_outputs(
-                image=res["image"],
-                label_map=res["label_map"],
-                binary_mask=res["binary_mask"],
-                palette=res["palette"],
-                out_dir=output_dir,
-                image_path=image_path,
-            )
+            fig.savefig(output_dir / f"{Path(image_path).stem}_det.png", dpi=150)
+        if args.save_json:
+            save_results_json(res, output_dir, image_path)
 
         if pdf is not None:
             pdf.savefig(fig)
 
         if args.show:
             plt.show()
+
+        plt.close(fig)
             
 
 if __name__ == "__main__":
     main()
+
+

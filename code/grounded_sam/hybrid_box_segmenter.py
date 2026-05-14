@@ -99,8 +99,8 @@ def load_and_segment(
     label_masks = defaultdict(list)
 
     print(f"ClipSeg")
-
-    inputs = processor(images=image, text=clipseg_text_prompt, return_tensors="pt").to(device)
+    clipseg_text_prompt = "fire. flame."
+    inputs = processor(images=image, text="fire. flame.", return_tensors="pt").to(device)
     with torch.no_grad():
         outputs = model(**inputs)
 
@@ -154,6 +154,7 @@ def load_and_segment(
 
             mask_boxed = np.zeros_like(clipseg_mask, dtype=bool)
             mask_boxed[y1:y2, x1:x2] = clipseg_mask[y1:y2, x1:x2]
+            print(f"Diffuse: {label}")
 
             if "smoke" in label:
                 label = "mixed" if label != "smoke" else "smoke"
@@ -190,7 +191,7 @@ def load_and_segment(
 
     merged_masks = {}
     for label, masks_list in label_masks.items():
-        #print(f"{label} label added")
+        print(f"{label} label added")
         merged = np.logical_or.reduce(masks_list)
         merged_masks[label] = merged
 
@@ -244,9 +245,10 @@ def load_and_segment(
 
     return {
         "image": image_np,
-        "label_map": label_map,
+        "label_map": label_map * (clipseg_mask > 0),
         #"binary_mask": (label_map > 0),
-        "binary_mask": (clipseg_mask > 0),
+        #"binary_mask": (clipseg_mask > 0),
+        "binary_mask": (label_map > 0) & (clipseg_mask > 0),
         "palette": PALETTE,
         "image_path": image_path
     }
